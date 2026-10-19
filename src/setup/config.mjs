@@ -1,9 +1,10 @@
-import { readFileSync, writeFileSync } from 'fs';
-import { resolve } from 'path';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { isIP } from 'node:net';
+import { resolve } from 'node:path';
 import cjson from 'comment-json';
 import deepFreeze from 'deep-freeze';
+import { clone, isPlainObject } from 'es-toolkit';
 import { jsonc } from 'jsonc';
-import _ from 'lodash-es';
 import emitter from '../utils/emitter.mjs';
 import { getDirname } from '../utils/path.mjs';
 
@@ -43,6 +44,7 @@ const noCheckPaths = new Set([
   'bot.chatgpt.prependMessages',
   'bot.chatgpt.additionParams',
   'bot.chatgpt.overrides',
+  'flaresolverr.proxy',
 ]);
 
 function recursiveCopy(c, dc, cc, dcc, parentPath = '') {
@@ -52,8 +54,8 @@ function recursiveCopy(c, dc, cc, dcc, parentPath = '') {
       dcc[key] = cc[key];
       continue;
     }
-    if (dcc && key in c && !_.isPlainObject(c[key])) {
-      dcc[key] = _.clone(c[key]);
+    if (dcc && key in c && !isPlainObject(c[key])) {
+      dcc[key] = clone(c[key]);
     }
     if (stringToArrayPaths.has(path)) {
       const defaultVal = [dc[key]].filter(val => val);
@@ -64,8 +66,8 @@ function recursiveCopy(c, dc, cc, dcc, parentPath = '') {
       } else c[key] = defaultVal;
       continue;
     }
-    if (_.isPlainObject(c[key]) && _.isPlainObject(dc[key])) {
-      recursiveCopy(c[key], dc[key], _.get(cc, key), _.get(dcc, key), path);
+    if (isPlainObject(c[key]) && isPlainObject(dc[key])) {
+      recursiveCopy(c[key], dc[key], cc?.[key], dcc?.[key], path);
     } else if (typeof c[key] === 'undefined' || typeof c[key] !== typeof dc[key]) {
       c[key] = dc[key];
     }
@@ -102,6 +104,19 @@ export function loadConfig(init = false) {
   const dConfCmt = conf.autoUpdateConfig === true && cjson.parse(readFileSync(DEFAULT_CONFIG_PATH).toString());
 
   // 配置迁移
+  if ('cqws' in conf) {
+    if (!('network' in conf)) {
+      const old = conf.cqws ?? {};
+      const host = old.host ?? '127.0.0.1';
+      conf.network = {
+        type: 'ws',
+        url: `ws://${isIP(host) === 6 ? `[${host}]` : host}:${old.port ?? 8080}/`,
+        token: old.accessToken ?? '',
+        reconnectionDelay: old.reconnection === false ? 0 : (old.reconnectionDelay ?? 5000),
+      };
+    }
+    delete conf.cqws;
+  }
   if ('picfinder' in conf && !('bot' in conf)) {
     conf.bot = conf.picfinder;
     delete conf.picfinder;
@@ -115,7 +130,7 @@ export function loadConfig(init = false) {
   migration(conf.bot, 'antiBiliMiniApp', 'bilibili');
   migration(conf.bot, 'getDojinDetailFromNhentai', 'getDoujinDetailFromNhentai');
   migration(conf.bot, 'handleBanedHosts', 'handleBannedHosts');
-  migration(_.get(conf, 'bot.setu'), 'sendPximgProxys', 'sendPximgProxies');
+  migration(conf?.bot?.setu, 'sendPximgProxys', 'sendPximgProxies');
 
   recursiveCopy(conf, dConf, confCmt, dConfCmt);
   if (dConfCmt) writeFileSync(CONFIG_PATH, cjson.stringify(dConfCmt, null, 2));

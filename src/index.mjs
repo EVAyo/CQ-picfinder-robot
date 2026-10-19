@@ -1,6 +1,5 @@
-import { CQWebSocket } from '@tsuk1ko/cq-websocket';
+import { cq } from '@aemeath-projects/napcat/utils';
 import Fs from 'fs-extra';
-import _ from 'lodash-es';
 import minimist from 'minimist';
 import RandomSeed from 'random-seed';
 import Akhr from './plugin/akhr/index.mjs';
@@ -15,32 +14,45 @@ import ocr from './plugin/ocr/index.mjs';
 import { rmdHandler } from './plugin/reminder.mjs';
 import saucenao, { snDB } from './plugin/saucenao.mjs';
 import sendSetu from './plugin/setu.mjs';
+import soutuBot from './plugin/soutuBot.mjs';
 import vits from './plugin/vits.mjs';
 import whatanime from './plugin/whatanime.mjs';
 import { loadConfig } from './setup/config.mjs';
 import { globalReg } from './setup/global.mjs';
 import asyncMap from './utils/asyncMap.mjs';
+import createBot from './utils/bot.mjs';
+import { botClientInfo } from './utils/botClientInfo.mjs';
 import { execUpdate } from './utils/checkUpdate.mjs';
 import CQ from './utils/CQcode.mjs';
 import emitter from './utils/emitter.mjs';
-import { getAntiShieldedCqImg64FromUrl } from './utils/image.mjs';
+import { IS_DOCKER } from './utils/env.mjs';
+import { MsgImage } from './utils/image.mjs';
 import logError from './utils/logError.mjs';
 import logger from './utils/logger.mjs';
+import { getRawMessage, isRepeatableMessage } from './utils/message.mjs';
 import { resolveByDirname } from './utils/path.mjs';
 import psCache from './utils/psCache.mjs';
+import { getRegWithCache } from './utils/regCache.mjs';
 import searchingMap from './utils/searchingMap.mjs';
 
 const { version } = Fs.readJsonSync(resolveByDirname(import.meta.url, '../package.json'));
 
-const bot = new CQWebSocket({
-  ...global.config.cqws,
-  forcePostFormat: 'string',
-});
+const bot = createBot(global.config.network);
 const rand = RandomSeed.create();
 
 // 全局变量
 globalReg({
   bot,
+  botClientInfo: {
+    name: '',
+    version: '',
+  },
+  botReady: async () => {
+    if (bot.isReady()) return;
+    return new Promise(resolve => {
+      bot.once('connect', resolve);
+    });
+  },
   replyMsg,
   sendMsg2Admin,
   parseArgs,
@@ -74,78 +86,95 @@ bot.on('request.friend', context => {
       flag: context.flag,
       sub_type: 'invite',
       approve: true,
-    });
+    }).catch(logError);
 });
 
 // 加群请求
 const groupAddRequests = {};
-bot.on('request.group.invite', context => {
+bot.on('request.group', context => {
+  if (context.sub_type !== 'invite') return;
   if (global.config.bot.autoAddGroup)
     bot('set_group_add_request', {
       flag: context.flag,
       approve: true,
-    });
+    }).catch(logError);
   else groupAddRequests[context.group_id] = context.flag;
 });
 
-// 设置监听器
-function setBotEventListener() {
-  ['message.private', 'message.group', 'message.group.@.me', 'message.guild', 'message.guild.@.me'].forEach(name =>
-    bot.off(name)
-  );
-  if (global.config.bot.enablePM) {
-    // 私聊
-    bot.on('message.private', privateAndAtMsg);
-  }
-  if (global.config.bot.enableGM) {
-    // 群组@
-    bot.on('message.group.@.me', privateAndAtMsg);
-    // 群组
-    bot.on('message.group', groupMsg);
-  }
-  if (global.config.bot.enableGuild) {
-    // 频道@
-    bot.on('message.guild.@.me', (e, ctx) => {
-      compatibleWithGuild(ctx);
-      privateAndAtMsg(e, ctx);
-    });
-    // 频道
-    bot.on('message.guild', (e, ctx) => {
-      compatibleWithGuild(ctx);
-      groupMsg(e, ctx);
-    });
-  }
-}
-setBotEventListener();
-emitter.onConfigReload(setBotEventListener);
+bot.on('message', async context => {
+  try {
+    const { enablePM, enableGM, enableGuild } = global.config.bot;
+    const type = context.message_type;
+    if (!((type === 'private' && enablePM) || (type === 'group' && enableGM) || (type === 'guild' && enableGuild))) {
+      return;
+    }
 
-function compatibleWithGuild(ctx) {
-  ctx.group_id = `${ctx.guild_id}_${ctx.channel_id}`;
+    // 数组消息直接检查消息段，避免把文本中的伪 CQ 码当成真正的 @
+    const segments = Array.isArray(context.message) ? context.message : cq.parse(context.message);
+    const selfId = type === 'guild' ? context.self_tiny_id : context.self_id;
+    const atMe =
+      selfId != null && segments.some(segment => segment.type === 'at' && String(segment.data.qq) === String(selfId));
+    if (Array.isArray(context.message)) context.message = getRawMessage(context);
+    if (type === 'guild') context.group_id = `${context.guild_id}_${context.channel_id}`;
+
+    let stopped = false;
+    const e = {
+      stopPropagation: () => {
+        stopped = true;
+      },
+    };
+    if (type === 'private' || atMe) await privateAndAtMsg(e, context);
+    if (type !== 'private' && !stopped) await groupMsg(e, context);
+  } catch (error) {
+    logError(error);
+  }
+});
+
+/**
+ * @callback MessageEventListener
+ * @param {{ stopPropagation: () => void }} e
+ * @param {*} context
+ * @returns {Promise<*>}
+ */
+
+function logConnectionError(e) {
+  if (e) console.error(e.message || e);
 }
 
 // 连接相关监听
 bot
-  .on('socket.connecting', (wsType, attempts) => console.log(`连接中[${wsType}]#${attempts}`))
-  .on('socket.failed', (wsType, attempts) => console.log(`连接失败[${wsType}]#${attempts}`))
-  .on('socket.error', (wsType, err) => {
-    console.error(`连接错误[${wsType}]`);
-    console.error(err);
-  })
-  .on('socket.connect', (wsType, sock, attempts) => {
-    console.log(`连接成功[${wsType}]#${attempts}`);
-    if (wsType === '/api') {
-      setTimeout(() => {
-        sendMsg2Admin(`已上线#${attempts}`);
-      }, 1000);
-    }
+  .on('reconnecting', attempt => console.log(`重连中 #${attempt}`))
+  .on('close', () => console.error('连接断开'))
+  .on('giveUp', () => console.error('重连次数耗尽，请重启程序以重新连接'))
+  .on('error', logConnectionError)
+  .on('connect', () => {
+    console.log('连接成功');
+    bot('get_version_info')
+      .then(({ retcode, data, message }) => {
+        if (retcode !== 0 || !data) {
+          console.error('获取客户端信息失败', message);
+          return;
+        }
+
+        console.log('客户端', data.app_name, data.app_version);
+        console.log('协议版本', data.protocol_version);
+
+        botClientInfo.setInfo({
+          name: data.app_name || '',
+          version: data.app_version || '',
+        });
+      })
+      .catch(logError);
+    sendMsg2Admin('已上线');
   });
 
 // connect
-bot.connect();
+console.log(global.config.network.type === 'ws-server' ? '等待连接中' : '开始连接', global.config.network.url);
+bot.connect().catch(logConnectionError);
 
 /**
  * 通用处理
- * @type {import('cq-websocket').MessageEventListener}
+ * @type {MessageEventListener}
  */
 async function commonHandle(e, context) {
   const config = global.config.bot;
@@ -166,7 +195,7 @@ async function commonHandle(e, context) {
   if (corpus(context)) return true;
 
   // 忽略指定正则的发言
-  if (config.regs.ignore && new RegExp(config.regs.ignore).test(context.message)) return true;
+  if (config.regs.ignore && getRegWithCache(config.regs, 'ignore').test(context.message)) return true;
 
   // 通用指令
   if (context.message === '--help') {
@@ -224,25 +253,24 @@ function handleAdminMsg(context) {
   if (group && typeof group === 'number') {
     if (typeof groupAddRequests[context.group_id] === 'undefined') {
       replyMsg(context, `将会同意进入群${group}的群邀请`);
-      // 注册一次性监听器
-      bot.once('request.group.invite', context2 => {
-        if (context2.group_id === group) {
-          bot('set_group_add_request', {
-            flag: context2.flag,
-            type: 'invite',
-            approve: true,
-          });
-          replyMsg(context, `已进入群${context2.group_id}`);
-          return true;
-        }
-        return false;
-      });
+      // 仅在指定群邀请命中后移除监听，其他邀请不会消耗它。
+      const acceptInvite = context2 => {
+        if (context2.sub_type !== 'invite' || context2.group_id !== group) return;
+        bot.off('request.group', acceptInvite);
+        bot('set_group_add_request', {
+          flag: context2.flag,
+          type: 'invite',
+          approve: true,
+        }).catch(logError);
+        replyMsg(context, `已进入群${context2.group_id}`);
+      };
+      bot.on('request.group', acceptInvite);
     } else {
       bot('set_group_add_request', {
         flag: groupAddRequests[context.group_id],
         type: 'invite',
         approve: true,
-      });
+      }).catch(logError);
       replyMsg(context, `已进入群${context.group_id}`);
       delete groupAddRequests[context.group_id];
     }
@@ -250,7 +278,7 @@ function handleAdminMsg(context) {
   }
 
   if (args.broadcast) {
-    broadcast(parseArgs(context.message, false, 'broadcast'));
+    broadcast(parseArgs(context.message, false, 'broadcast')).catch(logError);
     return true;
   }
 
@@ -282,9 +310,9 @@ function handleAdminMsg(context) {
 
   // 明日方舟
   if (args['update-akhr'] || args['akhr-update']) {
-    Akhr.updateData().then(success =>
-      replyMsg(context, success ? '方舟公招数据已更新' : '方舟公招数据更新失败，请查看错误日志')
-    );
+    Akhr.updateData()
+      .then(success => replyMsg(context, success ? '方舟公招数据已更新' : '方舟公招数据更新失败，请查看错误日志'))
+      .catch(logError);
     return true;
   }
 
@@ -293,7 +321,8 @@ function handleAdminMsg(context) {
 
   // 更新程序
   if (args['update-cqps']) {
-    replyMsg(context, '开始更新，完成后会重新启动').then(execUpdate);
+    if (IS_DOCKER) replyMsg(context, 'Docker 部署不支持一键更新');
+    else replyMsg(context, '开始更新，完成后会重新启动').then(execUpdate).catch(logError);
     return true;
   }
 
@@ -314,7 +343,7 @@ function handleAdminMsg(context) {
 
 /**
  * 私聊以及群组@的处理
- * @type {import('cq-websocket').MessageEventListener}
+ * @type {MessageEventListener}
  */
 async function privateAndAtMsg(e, context) {
   if (global.config.bot.debug) {
@@ -344,7 +373,7 @@ async function privateAndAtMsg(e, context) {
 
   if (context.message_type === 'group') {
     try {
-      const rMsgId = _.get(/^\[CQ:reply,id=(-?\d+).*\]/.exec(context.message), 1);
+      const rMsgId = /^\[CQ:reply,id=(-?\d+).*\]/.exec(context.message)?.[1];
       if (rMsgId) {
         const { data } = await bot('get_msg', { message_id: Number(rMsgId) });
         if (data) {
@@ -353,18 +382,16 @@ async function privateAndAtMsg(e, context) {
             e.stopPropagation();
             return;
           }
-          const imgs = getImgs(data.message);
-          const rMsg = imgs
-            .map(({ file, url }) => `[CQ:image,file=${CQ.escape(file, true)},url=${CQ.escape(url, true)}]`)
-            .join('');
-          context = { ...context, message: context.message.replace(/^\[CQ:reply,id=-?\d+.*?\]/, rMsg) };
+          const imgs = getImgs(getRawMessage(data));
+          const rMsg = imgs.map(img => img.toCQ()).join('');
+          context = { ...context, message: context.message.replace(/^\[CQ:reply,id=-?\d.*?\]/, rMsg) };
         } else {
           // 获取不到原消息，忽略
           e.stopPropagation();
           return;
         }
       }
-    } catch (error) {}
+    } catch {}
   }
 
   // 转换原图
@@ -376,16 +403,16 @@ async function privateAndAtMsg(e, context) {
   if (hasImage(context.message)) {
     // 搜图
     e.stopPropagation();
-    searchImg(context);
+    searchImg(context).catch(logError);
   } else if (context.message.search('--') !== -1) {
     // 忽略
   } else if (context.message_type === 'private') {
-    const dbKey = context.message === 'book' ? 'doujin' : context.message;
+    const dbKey = context.message;
     const db = snDB[dbKey];
     if (db) {
       logger.smSwitch(0, context.user_id, true);
       logger.smSetDB(0, context.user_id, db);
-      replyMsg(context, `已临时切换至[${dbKey}]搜图模式√`, true);
+      replyMsg(context, `已临时切换至【${dbKey}】搜图模式√`, true);
     } else {
       replyMsg(context, global.config.bot.replys.default, true);
     }
@@ -396,7 +423,7 @@ async function privateAndAtMsg(e, context) {
 
 /**
  * 群组消息处理
- * @type {import('cq-websocket').MessageEventListener}
+ * @type {MessageEventListener}
  */
 async function groupMsg(e, context) {
   if (global.config.bot.debug) {
@@ -423,7 +450,7 @@ async function groupMsg(e, context) {
   // 进入或退出搜图模式
   const { group_id, user_id } = context;
 
-  if (new RegExp(global.config.bot.regs.searchModeOn).test(context.message)) {
+  if (getRegWithCache(global.config.bot.regs, 'searchModeOn').test(context.message)) {
     // 进入搜图
     e.stopPropagation();
     if (
@@ -433,7 +460,7 @@ async function groupMsg(e, context) {
     ) {
       replyMsg(context, global.config.bot.replys.searchModeOn, true);
     } else replyMsg(context, global.config.bot.replys.searchModeAlreadyOn, true);
-  } else if (new RegExp(global.config.bot.regs.searchModeOff).test(context.message)) {
+  } else if (getRegWithCache(global.config.bot.regs, 'searchModeOff').test(context.message)) {
     e.stopPropagation();
     // 退出搜图
     if (logger.smSwitch(group_id, user_id, false)) replyMsg(context, global.config.bot.replys.searchModeOff, true);
@@ -445,7 +472,7 @@ async function groupMsg(e, context) {
   if (smStatus) {
     // 获取搜图模式下的搜图参数
     const getDB = () => {
-      const cmd = /^(all|pixiv|danbooru|doujin|book|anime)$/.exec(context.message);
+      const cmd = /^(all|pixiv|danbooru|doujin|book|anime|原图|ascii2d|soutubot)$/.exec(context.message);
       if (cmd) return snDB[cmd[1]] || -1;
       return -1;
     };
@@ -455,7 +482,7 @@ async function groupMsg(e, context) {
     if (cmdDB !== -1) {
       logger.smSetDB(group_id, user_id, cmdDB);
       smStatus = cmdDB;
-      replyMsg(context, `已切换至[${context.message}]搜图模式√`);
+      replyMsg(context, `已切换至【${context.message}】搜图模式√`);
     }
 
     // 有图片则搜图
@@ -466,9 +493,9 @@ async function groupMsg(e, context) {
         replyMsg(context, global.config.bot.replys.searchModeTimeout, true);
       });
       logger.smCount(group_id, user_id);
-      searchImg(context, smStatus);
+      searchImg(context, smStatus).catch(logError);
     }
-  } else if (global.config.bot.repeat.enable) {
+  } else if (global.config.bot.repeat.enable && isRepeatableMessage(context.message)) {
     // 复读（
     // 随机复读，rptLog得到当前复读次数
     if (
@@ -493,8 +520,7 @@ async function groupMsg(e, context) {
  * 搜图
  *
  * @param {*} context
- * @param {number} [customDB=-1]
- * @returns
+ * @param {number} [customDB]
  */
 async function searchImg(context, customDB = -1) {
   const args = parseArgs(context.message);
@@ -520,7 +546,8 @@ async function searchImg(context, customDB = -1) {
     else if (args.danbooru) db = snDB.danbooru;
     else if (args.doujin || args.book) db = snDB.doujin;
     else if (args.anime) db = snDB.anime;
-    else if (args.a2d) db = -10001;
+    else if (args.soutubot) db = snDB.soutubot;
+    else if (args.a2d || args.ascii2d) db = snDB.ascii2d;
     else if (context.message_type === 'private') {
       // 私聊搜图模式
       const sdb = logger.smStatus(0, context.user_id);
@@ -531,20 +558,24 @@ async function searchImg(context, customDB = -1) {
     }
   } else db = customDB;
 
+  if (db === snDB.原图) {
+    originImgConvert(context);
+    return;
+  }
+
   // 得到图片链接并搜图
   const msg = context.message;
   const imgs = getImgs(msg);
 
-  const incorrectImgs = _.remove(imgs, ({ url }) => !/^https?:\/\/[^&]+\//.test(url));
-  if (incorrectImgs.length) {
-    replyMsg(context, '部分图片无法获取，请尝试使用其他设备QQ发送', false, true);
-  }
-
   if (!imgs.length) return;
 
   // 获取图片链接
-  if (/(^|\s|\])链接($|\s|\[)/.test(context.message) || args['get-url']) {
-    replyMsg(context, _.map(imgs, 'url').join('\n'));
+  if (/(?:^|\s|\])链接(?:$|\s|\[)/.test(context.message) || args['get-url']) {
+    const validImgs = imgs.filter(img => img.isUrlValid);
+    if (validImgs.length !== imgs.length) {
+      replyMsg(context, '部分图片无法获取有效链接，请尝试使用其他设备QQ发送', false, true);
+    }
+    replyMsg(context, validImgs.map(img => img.url).join('\n'));
     return;
   }
 
@@ -559,8 +590,7 @@ async function searchImg(context, customDB = -1) {
       if (cache) {
         const msgs = cache.map(msg => `${CQ.escape('[缓存]')} ${msg}`);
         const antiShieldingMode = global.config.bot.antiShielding;
-        const cqImg =
-          antiShieldingMode > 0 ? await getAntiShieldedCqImg64FromUrl(img.url, antiShieldingMode) : CQ.img(img.file);
+        const cqImg = antiShieldingMode > 0 ? await img.getAntiShieldedCqImg64(antiShieldingMode) : img.toCQ();
         await replySearchMsgs(context, msgs, [cqImg]);
         continue;
       }
@@ -569,6 +599,15 @@ async function searchImg(context, customDB = -1) {
     // 检查搜图次数
     if (!isSendByAdmin(context) && !logger.applyQuota(context.user_id, { value: global.config.bot.searchLimit })) {
       replyMsg(context, global.config.bot.replys.personLimit, false, true);
+      return;
+    }
+
+    // 检查图片比例
+    if (
+      global.config.bot.stopSearchingHWRatioGt > 0 &&
+      !(await img.checkImageHWRatio(global.config.bot.stopSearchingHWRatioGt))
+    ) {
+      replyMsg(context, global.config.bot.replys.stopSearchingByHWRatio, false, true);
       return;
     }
 
@@ -586,12 +625,33 @@ async function searchImg(context, customDB = -1) {
     let success = true;
     let hasSucc = false;
     let snLowAcc = false;
-    let useAscii2d = args.a2d;
+    let useAscii2d = db === snDB.ascii2d;
+    const useSoutuBot = db === snDB.soutubot;
     let useWhatAnime = db === snDB.anime;
 
+    // SoutuBot
+    if (useSoutuBot) {
+      const { success: sbSuc, msgs: sbMsgs, sbErr } = await soutuBot(img).catch(sbErr => ({ sbErr }));
+      if (sbErr) {
+        success = false;
+        const errMsg =
+          (typeof sbErr === 'string' && sbErr) ||
+          (typeof sbErr.response === 'string' && sbErr.response) ||
+          sbErr.response?.data?.detail;
+        await replier.reply(`SoutuBot 搜索失败${errMsg ? `\n${errMsg}` : ''}`);
+        console.error('[error] SoutuBot');
+        logError(sbErr);
+      } else {
+        if (sbSuc) hasSucc = true;
+        if (!sbSuc) success = false;
+        await replier.reply(...sbMsgs);
+        needCacheMsgs.push(...sbMsgs);
+      }
+    }
+
     // saucenao
-    if (!useAscii2d) {
-      const snRes = await saucenao(img.url, db, args.debug || global.config.bot.debug);
+    if (!useAscii2d && !useSoutuBot) {
+      const snRes = await saucenao(img, db, args.debug || global.config.bot.debug);
       if (!snRes.success) success = false;
       if (snRes.success) hasSucc = true;
       if (snRes.lowAcc) snLowAcc = true;
@@ -603,21 +663,21 @@ async function searchImg(context, customDB = -1) {
       ) {
         useAscii2d = true;
       }
-      if (!snRes.lowAcc && snRes.msg.indexOf('anidb.net') !== -1) useWhatAnime = true;
+      if (!snRes.lowAcc && snRes.msg.includes('anidb.net')) useWhatAnime = true;
       if (snRes.msg.length > 0) needCacheMsgs.push(snRes.msg);
       await replier.reply(snRes.msg, snRes.warnMsg);
     }
 
     // ascii2d
     if (useAscii2d) {
-      const { color, bovw, success: asSuc, asErr } = await ascii2d(img.url, snLowAcc).catch(asErr => ({ asErr }));
+      const { color, bovw, success: asSuc, asErr } = await ascii2d(img, snLowAcc).catch(asErr => ({ asErr }));
       if (asErr) {
         success = false;
         const errMsg =
-          (asErr.response && asErr.response.data.length < 100 && `\n${asErr.response.data}`) ||
-          (asErr.message && `\n${asErr.message}`) ||
-          '';
-        await replier.reply(`ascii2d 搜索失败${errMsg}`);
+          (typeof asErr === 'string' && asErr) ||
+          (asErr.response && asErr.response.data.length < 100 && asErr.response.data) ||
+          asErr.message;
+        await replier.reply(`ascii2d 搜索失败${errMsg ? `\n${errMsg}` : ''}`);
         console.error('[error] ascii2d');
         logError(asErr);
       } else {
@@ -630,7 +690,7 @@ async function searchImg(context, customDB = -1) {
 
     // 搜番
     if (useWhatAnime) {
-      const waRet = await whatanime(img.url, args.debug || global.config.bot.debug);
+      const waRet = await whatanime(img, args.debug || global.config.bot.debug);
       if (waRet.success) hasSucc = true;
       if (!waRet.success) success = false; // 如果搜番有误也视作不成功
       await replier.reply(...waRet.msgs);
@@ -681,7 +741,7 @@ function doAkhr(context) {
     };
 
     const handleError = e => {
-      replyMsg(context, '词条识别出现错误：\n' + e);
+      replyMsg(context, `词条识别出现错误：\n${e}`);
       console.error('[error] Akhr');
       logError(e);
     };
@@ -698,15 +758,11 @@ function doAkhr(context) {
  * 从消息中提取图片
  *
  * @param {string} msg
- * @returns {Array<{ file: string; url: string; }>} 图片URL数组
+ * @returns {MsgImage[]} 图片URL数组
  */
 function getImgs(msg) {
   const cqImgs = CQ.from(msg).filter(cq => cq.type === 'image');
-  return cqImgs.map(cq => {
-    const data = cq.pickData(['file', 'url']);
-    data.url = getUniversalImgURL(data.url);
-    return data;
-  });
+  return cqImgs.map(cq => new MsgImage(cq));
 }
 
 /**
@@ -716,7 +772,7 @@ function getImgs(msg) {
  * @returns 有则返回true
  */
 function hasImage(msg) {
-  return msg.indexOf('[CQ:image') !== -1;
+  return msg.includes('[CQ:image');
 }
 
 /**
@@ -730,7 +786,7 @@ export function sendMsg2Admin(message) {
     bot('send_private_msg', {
       user_id: admin,
       message,
-    });
+    }).catch(logError);
   }
 }
 
@@ -742,7 +798,14 @@ export function sendMsg2Admin(message) {
  * @param {boolean} at 是否at发送者
  * @param {boolean} reply 是否使用回复形式
  */
-export async function replyMsg(context, message, at = false, reply = false) {
+export function replyMsg(context, message, at = false, reply = false) {
+  const response = sendReplyMsg(context, message, at, reply);
+  // 忽略回复结果时也处理拒绝；返回原 Promise，调用者仍可 await/catch 错误。
+  response.catch(logError);
+  return response;
+}
+
+async function sendReplyMsg(context, message, at, reply) {
   if (!bot.isReady() || typeof message !== 'string' || message.length === 0) return;
   if (context.message_type === 'group' && typeof context.group_id === 'string' && context.group_id.includes('_')) {
     const [guild_id, channel_id] = context.group_id.split('_');
@@ -755,7 +818,7 @@ export async function replyMsg(context, message, at = false, reply = false) {
       },
       message,
       at,
-      reply
+      reply,
     );
   }
 
@@ -820,7 +883,7 @@ export async function replySearchMsgs(
   ctx,
   msgs,
   forwardPrependMsgs = [],
-  { groupForwardSearchResult, privateForwardSearchResult, pmSearchResult, pmSearchResultTemp } = global.config.bot
+  { groupForwardSearchResult, privateForwardSearchResult, pmSearchResult, pmSearchResultTemp } = global.config.bot,
 ) {
   msgs = msgs.filter(msg => msg && typeof msg === 'string');
   if (msgs.length === 0) return;
@@ -902,7 +965,7 @@ function createForwardNodes(ctx, msgs, prependCtxMsg = false) {
   const messages = msgs.map(content => ({
     type: 'node',
     data: {
-      name: '\u200b',
+      name: 'QQ用户',
       uin: String(ctx.self_id),
       content,
     },
@@ -941,12 +1004,12 @@ function getRand() {
 export function parseArgs(str, enableArray = false, _key = null) {
   const m = minimist(
     str
-      .replace(/(--[\w-]+)(?:\s*)(\[CQ:)/g, '$1 $2')
-      .replace(/(\[CQ:[^\]]+\])(?:\s*)(--[\w-]+)/g, '$1 $2')
+      .replace(/(--[\w-]+)\s*(\[CQ:)/g, '$1 $2')
+      .replace(/(\[CQ:[^\]]+\])\s*(--[\w-]+)/g, '$1 $2')
       .split(' '),
     {
       boolean: true,
-    }
+    },
   );
   if (!enableArray) {
     for (const key in m) {
@@ -954,22 +1017,12 @@ export function parseArgs(str, enableArray = false, _key = null) {
       if (Array.isArray(m[key])) m[key] = m[key][0];
     }
   }
-  if (_key && typeof m[_key] === 'string' && m._.length > 0) m[_key] += ' ' + m._.join(' ');
+  if (_key && typeof m[_key] === 'string' && m._.length > 0) m[_key] += ` ${m._.join(' ')}`;
   return m;
 }
 
 function debugMsgDeleteBase64Content(msg) {
   return msg.replace(/base64:\/\/[a-z\d+/=]+/gi, '(base64)');
-}
-
-function getUniversalImgURL(url = '') {
-  if (/^https?:\/\/(c2cpicdw|gchat)\.qpic\.cn\/(offpic|gchatpic)_new\//.test(url)) {
-    return url
-      .replace('/c2cpicdw.qpic.cn/offpic_new/', '/gchat.qpic.cn/gchatpic_new/')
-      .replace(/\/\d+\/+\d+-\d+-/, '/0/0-0-')
-      .replace(/\?.*$/, '');
-  }
-  return url;
 }
 
 function isSendByAdmin(ctx) {
@@ -979,9 +1032,13 @@ function isSendByAdmin(ctx) {
 }
 
 function handleOriginImgConvert(ctx) {
-  if (!(/(^|\s|\])原图($|\s|\[)/.test(ctx.message) && hasImage(ctx.message))) return;
-  const cqImgs = CQ.from(ctx.message).filter(cq => cq.type === 'image');
-  const imgs = cqImgs.map(cq => CQ.img(cq.get('file')));
-  replyMsg(ctx, imgs.join(''), false, false);
+  if (!(/(?:^|\s|\])原图(?:$|\s|\[)/.test(ctx.message) && hasImage(ctx.message))) return;
+  originImgConvert(ctx);
   return true;
+}
+
+function originImgConvert(ctx) {
+  const imgs = getImgs(ctx.message);
+  const lines = imgs.map(img => (img.isUrlValid ? img.url : '获取原图链接失败'));
+  replyMsg(ctx, lines.join('\n'), false, false);
 }
